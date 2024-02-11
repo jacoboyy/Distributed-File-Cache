@@ -2,7 +2,7 @@ This provides the libraries and classes needed for Project 2.
 
 The tools directory contains binary tools that perform I/O operations.
 These will work on Linux x86 64-bit platforms (e.g., Andrew servers).
-These are a subset ofthe tools used in Project 1.
+These are a subset of the tools used in Project 1.
 
 The lib directory has lib440lib.so.  This is an interposition library
 that will redirect file operations to RPC calls. It is used just like
