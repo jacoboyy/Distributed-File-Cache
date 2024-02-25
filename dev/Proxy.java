@@ -27,61 +27,39 @@ class Proxy {
 		private HashSet<Integer> readOnlyFds = new HashSet<>();
 
 		public synchronized ServerFile readServerFile( String path, OpenOption o, int version ) {
+			ServerFile response = new ServerFile(-1);
 			try {
-				if (stub == null) {
-					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-					stub = (RMIInterface) registry.lookup("RMIInterface");
-				}
-				ServerFile response = stub.readServerFile(path, o, version);
-				return response;
+				response = stub.readServerFile(path, o, version);
 			} catch (RemoteException e) {
-				System.err.println("Unable to locate registry or unable to call RPC readServerFile");
-				e.printStackTrace();
-				System.exit(1);
-			} catch (NotBoundException e) {
-				System.err.println("RMIInterface not found");
+				System.err.println("Unable to call RPC readServerFile");
 				e.printStackTrace();
 				System.exit(1);
 			}
-			return new ServerFile(-1);
+			return response;
 		}
 
 		public synchronized int unlinkServerFile( String path ) {
+			int result = -1;
 			try {
-				if (stub == null) {
-					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-					stub = (RMIInterface) registry.lookup("RMIInterface");
-				}
-				return stub.unlinkServerFile(path);
+				result = stub.unlinkServerFile(path);
 			} catch (RemoteException e) {
-				System.err.println("Unable to locate registry or unable to call RPC readServerFile");
-				e.printStackTrace();
-				System.exit(1);
-			} catch (NotBoundException e) {
-				System.err.println("RMIInterface not found");
+				System.err.println("Unable to call RPC unlinkServerFile");
 				e.printStackTrace();
 				System.exit(1);
 			}
-			return -1;
+			return result;
 		}
 
 		public synchronized int writeServerFile( String path, byte[] content) {
+			int version = -1;
 			try {
-				if (stub == null) {
-					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-					stub = (RMIInterface) registry.lookup("RMIInterface");
-				}
-				return stub.writeServerFile(path, content);
+				version = stub.writeServerFile(path, content);
 			} catch (RemoteException e) {
-				System.err.println("Unable to locate registry or unable to call RPC readServerFile");
-				e.printStackTrace();
-				System.exit(1);
-			} catch (NotBoundException e) {
-				System.err.println("RMIInterface not found");
+				System.err.println("Unable to call RPC writeServerFile");
 				e.printStackTrace();
 				System.exit(1);
 			}
-			return -1;
+			return version;
 		}
 
 		public synchronized int open( String path, OpenOption o ) {
@@ -348,7 +326,19 @@ class Proxy {
 		cacheDir = args[2];
 		cache = new Cache(Integer.valueOf(args[3]), cacheDir);
 		nextFd = 0;
-		stub = null;
+		// look up remote server
+		try {
+			Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
+			stub = (RMIInterface) registry.lookup("RMIInterface");
+		} catch (RemoteException e) {
+			System.err.println("Unable to locate registry");
+			e.printStackTrace();
+			System.exit(1);
+		} catch (NotBoundException e) {
+			System.err.println("RMIInterface not found");
+			e.printStackTrace();
+			System.exit(1);
+		}
 		(new RPCreceiver(new FileHandlingFactory())).run();
 	}
 }
