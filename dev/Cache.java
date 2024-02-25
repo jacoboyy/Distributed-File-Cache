@@ -1,14 +1,13 @@
 import java.io.File;
-import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
-
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 class Cache {
     private long capacity;
     private String cacheDir;
     private Node head;
     private Node tail;
-    private ConcurrentHashMap<String, ArrayList<Node>> cache;
+    private ConcurrentHashMap<String, ConcurrentLinkedQueue<Node>> cache;
     private long curSize;
 
     public Cache(long capacity, String cacheDir) {
@@ -23,9 +22,9 @@ class Cache {
     }
 
     public synchronized Node getReadableNode(String pathName) {
+        Node res = null;
         if (cache.containsKey(pathName) && !cache.get(pathName).isEmpty()) {
             // read the latest version
-            Node res = null;
             int maxVersion = -1;
             for (Node node: cache.get(pathName)) {
                 if (node.isReadable() && node.version > maxVersion) {
@@ -33,10 +32,8 @@ class Cache {
                     maxVersion = node.version;
                 }
             }
-            if (res != null)
-                return res;
         }
-        return null;
+        return res;
     }
 
     public synchronized void moveFront(Node node) {
@@ -78,6 +75,14 @@ class Cache {
         return false;
     }
 
+    public synchronized void removeStaleCopy(String pathName) {
+        if (cache.containsKey(pathName) && !cache.get(pathName).isEmpty()){
+            for (Node node: cache.get(pathName))
+                if (node.isEvictable())
+                    removeNode(node);
+        }
+    }
+
     public synchronized boolean addNode(Node node) {
         // evict first
         while (curSize + node.size > capacity) 
@@ -90,7 +95,7 @@ class Cache {
         head.next = node;
         // add cache entry
         if (!cache.containsKey(node.pathName)) 
-            cache.put(node.pathName, new ArrayList<Node>());
+            cache.put(node.pathName, new ConcurrentLinkedQueue<Node>());
         cache.get(node.pathName).add(node);
         // update cache size
         curSize += node.size;

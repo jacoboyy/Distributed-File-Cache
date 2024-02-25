@@ -53,11 +53,15 @@ class Node {
 
     public void updateVersion(int version) {
         this.version = version;
-        readable = true;
     }
 
     public void updateSize(long newSize) {
         size = newSize;
+    }
+
+    public void updateFileName(String newFileName) {
+        fileName = newFileName;
+        readable = true;
     }
 
     public long getFileSize() {

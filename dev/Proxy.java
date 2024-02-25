@@ -16,6 +16,7 @@ class Proxy {
 	private static String cacheDir;
 	private static Cache cache;
 	public static int nextFd;
+	public static RMIInterface stub;
 
 	private static class FileHandler implements FileHandling {
 
@@ -26,10 +27,11 @@ class Proxy {
 		private HashSet<Integer> readOnlyFds = new HashSet<>();
 
 		public synchronized ServerFile readServerFile( String path, OpenOption o, int version ) {
-			RMIInterface stub;
 			try {
-				Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-				stub = (RMIInterface) registry.lookup("RMIInterface");
+				if (stub == null) {
+					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
+					stub = (RMIInterface) registry.lookup("RMIInterface");
+				}
 				ServerFile response = stub.readServerFile(path, o, version);
 				return response;
 			} catch (RemoteException e) {
@@ -45,10 +47,11 @@ class Proxy {
 		}
 
 		public synchronized int unlinkServerFile( String path ) {
-			RMIInterface stub;
 			try {
-				Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-				stub = (RMIInterface) registry.lookup("RMIInterface");
+				if (stub == null) {
+					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
+					stub = (RMIInterface) registry.lookup("RMIInterface");
+				}
 				return stub.unlinkServerFile(path);
 			} catch (RemoteException e) {
 				System.err.println("Unable to locate registry or unable to call RPC readServerFile");
@@ -63,10 +66,11 @@ class Proxy {
 		}
 
 		public synchronized int writeServerFile( String path, byte[] content) {
-			RMIInterface stub;
 			try {
-				Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
-				stub = (RMIInterface) registry.lookup("RMIInterface");
+				if (stub == null) {
+					Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
+					stub = (RMIInterface) registry.lookup("RMIInterface");
+				}
 				return stub.writeServerFile(path, content);
 			} catch (RemoteException e) {
 				System.err.println("Unable to locate registry or unable to call RPC readServerFile");
@@ -94,7 +98,7 @@ class Proxy {
 			RandomAccessFile file;
 			if (o == OpenOption.CREATE_NEW) {
 				// create new file on proxy
-				String newFileName = nextFd + "_" + normalizedPath;
+				String newFileName = normalizedPath + "_v" + response.version;
 				try {
 					file = new RandomAccessFile(cacheDir + "/" + newFileName, "rw");
 				} catch (Exception e) {
@@ -103,6 +107,8 @@ class Proxy {
 				fdToRead.put(nextFd, file);
 				Node newNode = new Node(normalizedPath, newFileName, 1, response.version, 0);
 				fdToNode.put(nextFd, newNode);
+				// clean-up stale cache copies
+				cache.removeStaleCopy(normalizedPath);
 				if (!cache.addNode(newNode))
 					return Errors.EBUSY;
 				return nextFd++;
@@ -121,7 +127,8 @@ class Proxy {
 					cache.moveFront(node);
 				} else {
 					// file not on cache or outdated
-					String newFileName = nextFd + "_" + normalizedPath;
+					System.err.println("file not cached or outdated");
+					String newFileName =  normalizedPath + "_v" + response.version;
 					long fileSize;
 					try {
 						file = new RandomAccessFile(cacheDir + '/' + newFileName, "rw");
@@ -134,6 +141,8 @@ class Proxy {
 					fdToRead.put(nextFd, file);
 					Node newNode = new Node(normalizedPath, newFileName, 1, response.version, fileSize);
 					fdToNode.put(nextFd, newNode);
+					// clean-up stale cache copies
+					cache.removeStaleCopy(normalizedPath);
 					if (!cache.addNode(newNode))
 						return Errors.EBUSY;
 				}
@@ -169,9 +178,18 @@ class Proxy {
 					e.printStackTrace();
 					return -1;
 				}
-				// update file version in cache and change visibility
+				// update file version
 				int version = writeServerFile(node.pathName, content);
 				node.updateVersion(version);
+				// rename file and change visibility
+				String newFileName = node.pathName + "_v" + version;
+				File origFile = new File(cacheDir + "/" + node.fileName);
+				File newFile = new File(cacheDir + "/" + newFileName);
+				origFile.renameTo(newFile);
+				System.err.println("Write file renamed from " + node.fileName + " to " + newFileName);
+				node.updateFileName(newFileName);
+				// clean-up stale copy
+				cache.removeStaleCopy(node.pathName);
 			}
 			// update cache entry
 			cache.moveFront(node);
@@ -201,7 +219,8 @@ class Proxy {
 			// create new write file on first write
 			if (!fdToWrite.containsKey(fd)) {
 				Node readNode = fdToNode.get(fd);
-				String newFileName = "write_" + readNode.fileName;
+				// assign unique file name
+				String newFileName = "write_" + fd + "_" + readNode.fileName;
 				try {
 					readFile = fdToRead.get(fd);
 					long pos = readFile.getFilePointer();
@@ -304,7 +323,6 @@ class Proxy {
 		}
 
 		public void clientdone(){
-			System.err.println("clientdone called");
 			// close open files
 			for (int fd: fdToNode.keySet())
 				close(fd);
@@ -330,6 +348,7 @@ class Proxy {
 		cacheDir = args[2];
 		cache = new Cache(Integer.valueOf(args[3]), cacheDir);
 		nextFd = 0;
+		stub = null;
 		(new RPCreceiver(new FileHandlingFactory())).run();
 	}
 }

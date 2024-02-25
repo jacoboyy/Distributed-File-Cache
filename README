@@ -29,7 +29,7 @@ The sample directory has a simple skeleton implementation of a proxy
 class, that shows how to interface to RPCreceiver.  To compile the sample,
 make sure your CLASSPATH environment variable includes the absolute paths
 to the lib and sample directories:
-	export CLASSPATH=$PWD/lib:$PWD/sample
+	export CLASSPATH=$PWD/lib:$PWD/dev
 	(Use setenv if not using bash).
 Then cd into the sample directory and run make.  Now you can run the 
 skeleton proxy using:
