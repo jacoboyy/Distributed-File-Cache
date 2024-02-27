@@ -66,6 +66,17 @@ class Proxy {
 			System.err.println("Open called on " + path + " with OpenOption = " + o);
 			String normalizedPath = Paths.get(path).normalize().toString();
 			if (normalizedPath.startsWith("..")) return Errors.EPERM;
+			
+			// create subdirectory if needed
+			File cacheFile = new File(normalizedPath);
+			String parentDirName = cacheFile.getParent();
+			if (parentDirName != null) {
+				File parentDir = new File(cacheDir + "/" + parentDirName);
+				if (!parentDir.exists()) {
+					System.err.println("Create parent dir " + parentDirName + " of " + normalizedPath);
+					parentDir.mkdirs();
+				}
+			}
 
 			// check if proxy has copy
 			Node node = cache.getReadableNode(normalizedPath);
