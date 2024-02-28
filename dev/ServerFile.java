@@ -10,15 +10,13 @@ public class ServerFile implements Serializable {
     public int errno;
     // Version number
     public int version;
+    // Total file size
+    public long fileSize;
 
-    public ServerFile(byte[] content, int version) {
+    public ServerFile(byte[] content, int version, long fileSize) {
         this.content = content;
         this.version = version;
-        valid = true;
-    }
-
-    public ServerFile(byte[] content) {
-        this.content = content;
+        this.fileSize = fileSize;
         valid = true;
     }
 

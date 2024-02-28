@@ -17,6 +17,7 @@ class Proxy {
 	private static Cache cache;
 	public static int nextFd;
 	public static RMIInterface stub;
+	public static long chunkSize = 400000;
 
 	private static class FileHandler implements FileHandling {
 
@@ -26,10 +27,10 @@ class Proxy {
 		private ConcurrentHashMap<Integer, File> fdToDir = new ConcurrentHashMap<>();
 		private HashSet<Integer> readOnlyFds = new HashSet<>();
 
-		public synchronized ServerFile readServerFile( String path, OpenOption o, int version ) {
+		public synchronized ServerFile readServerFile( String path, OpenOption o, int version, int offset) {
 			ServerFile response = new ServerFile(-1);
 			try {
-				response = stub.readServerFile(path, o, version);
+				response = stub.readServerFile(path, o, version, offset);
 			} catch (RemoteException e) {
 				System.err.println("Unable to call RPC readServerFile");
 				e.printStackTrace();
@@ -50,10 +51,10 @@ class Proxy {
 			return result;
 		}
 
-		public synchronized int writeServerFile( String path, byte[] content) {
+		public synchronized int writeServerFile( String path, byte[] content, int offset) {
 			int version = -1;
 			try {
-				version = stub.writeServerFile(path, content);
+				version = stub.writeServerFile(path, content, offset);
 			} catch (RemoteException e) {
 				System.err.println("Unable to call RPC writeServerFile");
 				e.printStackTrace();
@@ -63,83 +64,91 @@ class Proxy {
 		}
 
 		public synchronized int open( String path, OpenOption o ) {
-			System.err.println("Open called on " + path + " with OpenOption = " + o);
-			String normalizedPath = Paths.get(path).normalize().toString();
-			if (normalizedPath.startsWith("..")) return Errors.EPERM;
-			
-			// create subdirectory if needed
-			File cacheFile = new File(normalizedPath);
-			String parentDirName = cacheFile.getParent();
-			if (parentDirName != null) {
-				File parentDir = new File(cacheDir + "/" + parentDirName);
-				if (!parentDir.exists()) {
-					System.err.println("Create parent dir " + parentDirName + " of " + normalizedPath);
-					parentDir.mkdirs();
+			synchronized (cache) {
+				System.err.println("Open called on " + path + " with OpenOption = " + o);
+				String normalizedPath = Paths.get(path).normalize().toString();
+				if (normalizedPath.startsWith("..")) return Errors.EPERM;
+				
+				// create subdirectory if needed
+				File cacheFile = new File(normalizedPath);
+				String parentDirName = cacheFile.getParent();
+				if (parentDirName != null) {
+					File parentDir = new File(cacheDir + "/" + parentDirName);
+					if (!parentDir.exists()) {
+						System.err.println("Create parent dir " + parentDirName + " of " + normalizedPath);
+						parentDir.mkdirs();
+					}
 				}
-			}
 
-			// check if proxy has copy
-			Node node = cache.getReadableNode(normalizedPath);
-			// check file status on server
-			ServerFile response = readServerFile(normalizedPath, o, (node != null) ? node.version : -1);
-			if (!response.valid) return response.errno;
-			
-			RandomAccessFile file;
-			if (o == OpenOption.CREATE_NEW) {
-				// create new file on proxy
-				String newFileName = normalizedPath + "_v" + response.version;
-				try {
-					file = new RandomAccessFile(cacheDir + "/" + newFileName, "rw");
-				} catch (Exception e) {
-					return Errors.EPERM;
-				}
-				fdToRead.put(nextFd, file);
-				Node newNode = new Node(normalizedPath, newFileName, 1, response.version, 0);
-				fdToNode.put(nextFd, newNode);
-				// clean-up stale cache copies
-				cache.removeStaleCopy(normalizedPath);
-				if (!cache.addNode(newNode))
-					return Errors.EBUSY;
-				return nextFd++;
-			} else if (o == OpenOption.CREATE || o == OpenOption.READ || o == OpenOption.WRITE) {
-				if (node != null && response.version == node.version) {
-					// file already cached and version is up-to-date
-					System.err.println("file cached and version up-to-date");
+				// check if proxy has copy
+				Node node = cache.getReadableNode(normalizedPath);
+				// check file status on server
+				ServerFile response = readServerFile(normalizedPath, o, (node != null) ? node.version : -1, 0);
+				if (!response.valid) return response.errno;
+				long fileSize = response.fileSize;
+				
+				RandomAccessFile file;
+				if (o == OpenOption.CREATE_NEW) {
+					// create new file on proxy
+					String newFileName = normalizedPath + "_v" + response.version;
 					try {
-						file = new RandomAccessFile(cacheDir + "/" + node.fileName, "rw");
+						file = new RandomAccessFile(cacheDir + "/" + newFileName, "rw");
 					} catch (Exception e) {
 						return Errors.EPERM;
 					}
 					fdToRead.put(nextFd, file);
-					fdToNode.put(nextFd, node);
-					node.incrRef();
-					cache.moveFront(node);
-				} else {
-					// file not on cache or outdated
-					System.err.println("file not cached or outdated");
-					String newFileName =  normalizedPath + "_v" + response.version;
-					long fileSize;
-					try {
-						file = new RandomAccessFile(cacheDir + '/' + newFileName, "rw");
-						file.write(response.content);
-						file.seek(0);
-						fileSize = file.length();
-					} catch (Exception e) {
-						return Errors.EPERM;
-					}
-					fdToRead.put(nextFd, file);
-					Node newNode = new Node(normalizedPath, newFileName, 1, response.version, fileSize);
+					Node newNode = new Node(normalizedPath, newFileName, 1, response.version, 0);
 					fdToNode.put(nextFd, newNode);
 					// clean-up stale cache copies
 					cache.removeStaleCopy(normalizedPath);
 					if (!cache.addNode(newNode))
 						return Errors.EBUSY;
+					return nextFd++;
+				} else if (o == OpenOption.CREATE || o == OpenOption.READ || o == OpenOption.WRITE) {
+					if (node != null && response.version == node.version) {
+						// file already cached and version is up-to-date
+						System.err.println("file cached and version up-to-date");
+						try {
+							file = new RandomAccessFile(cacheDir + "/" + node.fileName, "rw");
+						} catch (Exception e) {
+							return Errors.EPERM;
+						}
+						fdToRead.put(nextFd, file);
+						fdToNode.put(nextFd, node);
+						node.incrRef();
+						cache.moveFront(node);
+					} else {
+						// file not on cache or outdated
+						String newFileName =  normalizedPath + "_v" + response.version;
+						try {
+							file = new RandomAccessFile(cacheDir + '/' + newFileName, "rw");
+							file.write(response.content);
+							int offset = response.content.length;
+							// perform chunked write
+							while (offset < fileSize) {
+								response = readServerFile(normalizedPath, o, (node != null) ? node.version : -1, offset);
+								file.write(response.content);
+								offset += response.content.length;
+							}
+							// reset file pointer for next read/write
+							file.seek(0);
+						} catch (Exception e) {
+							return Errors.EPERM;
+						}
+						fdToRead.put(nextFd, file);
+						Node newNode = new Node(normalizedPath, newFileName, 1, response.version, fileSize);
+						fdToNode.put(nextFd, newNode);
+						// clean-up stale cache copies
+						cache.removeStaleCopy(normalizedPath);
+						if (!cache.addNode(newNode))
+							return Errors.EBUSY;
+					}
+					if (o == OpenOption.READ) 
+						readOnlyFds.add(nextFd);
+					return nextFd++;
+				} else {
+					return Errors.EINVAL;
 				}
-				if (o == OpenOption.READ) 
-					readOnlyFds.add(nextFd);
-				return nextFd++;
-			} else {
-				return Errors.EINVAL;
 			}
 		}
 
@@ -158,17 +167,25 @@ class Proxy {
 			if (fdToWrite.containsKey(fd)) {
 				System.err.println("Propagate changes in " + node.fileName + " back to server!");
 				// propagate changes back to server
-				byte[] content;
+				int version = -1;
+				long fileSize;
 				try {
 					file.seek(0);
-					content = new byte[(int) file.length()];
-					file.readFully(content);
+					fileSize = file.length();
+					int offset = 0;
+					while (offset < fileSize) {
+						// write at most chunksize
+						byte[] writeBuf = new byte[(int) Math.min(chunkSize, fileSize - offset)];
+						// copy file content
+						file.readFully(writeBuf);
+						version = writeServerFile(node.pathName, writeBuf, offset);
+						offset += writeBuf.length;
+					}
 				} catch (Exception e) {
 					e.printStackTrace();
 					return -1;
 				}
-				// update file version
-				int version = writeServerFile(node.pathName, content);
+				// update file version		
 				node.updateVersion(version);
 				// rename file and change visibility
 				String newFileName = node.pathName + "_v" + version;
@@ -209,20 +226,23 @@ class Proxy {
 			if (!fdToWrite.containsKey(fd)) {
 				Node readNode = fdToNode.get(fd);
 				// assign unique file name
-				String newFileName = "write_" + fd + "_" + readNode.fileName;
+				String newFileName = readNode.fileName + "_write_" + fd;
 				try {
 					readFile = fdToRead.get(fd);
-					long pos = readFile.getFilePointer();
-					// read original file content
-					readFile.seek(0);
-					byte[] content = new byte[(int) readFile.length()];
-					readFile.readFully(content);
-					// copy file content
+					fileSize = readFile.length();
 					writeFile = new RandomAccessFile(cacheDir + "/" + newFileName, "rw");
-					writeFile.write(content);
+					long pos = readFile.getFilePointer();
+					// chunked copy from readFile to writeFile
+					int offset = 0;
+					readFile.seek(offset);
+					while (offset < fileSize) {
+						byte[] content = new byte[(int) Math.min(chunkSize, fileSize - offset)];
+						readFile.readFully(content);
+						writeFile.write(content);
+						offset += content.length;
+					}
 					// copy file pointer
 					writeFile.seek(pos);
-					fileSize = writeFile.length();
 					// close read file
 					readFile.close();
 				} catch (Exception e) {
