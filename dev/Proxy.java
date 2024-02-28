@@ -1,4 +1,12 @@
-/* Sample skeleton for proxy */
+/*
+ * @file:   Proxy.java
+ * @author: Jacob Wang <tengdaw@andrew.cmu.edu>
+ * Implementation of a proxy that sits between client and server and provides whole-file 
+ * caching with an LRU replacement policy. Java RMI library is used for the RPC between 
+ * proxy and client. The proxy adopts an AFS-1 like check-on-open cache consistency model 
+ * which enforces one-copy-semantic at open-close session granularity. For concurrent write 
+ * to the same file, the late write will win.
+ */
 
 import java.io.*;
 import java.util.*;
@@ -11,81 +19,107 @@ import java.util.concurrent.ConcurrentHashMap;
 
 class Proxy {
 	
-	private static String serverIP;
-	private static int serverPort;
-	private static String cacheDir;
-	private static Cache cache;
-	public static int nextFd;
-	public static RMIInterface stub;
-	public static long chunkSize = 400000;
+	private static String serverIP;			// server IP
+	private static int serverPort;			// server port number
+	private static String cacheDir;			// cache root directory
+	private static Cache cache;				// proxy cache
+	public static int nextFd;				// a strictly increasing number to supply the unique file descriptor
+	public static RMIInterface stub;		// RMI interface for RPC call to the server
+	public static long chunkSize = 400000;	// maximum size for data transfer in an RPC call
 
+	/* A nested class to handle each individual client */
 	private static class FileHandler implements FileHandling {
 
+		// associate a file descriptor to an LRU node in the cache
 		private ConcurrentHashMap<Integer, Node> fdToNode = new ConcurrentHashMap<>();
+		// track RandomAccessFile object of read file descriptors
 		private ConcurrentHashMap<Integer, RandomAccessFile> fdToRead = new ConcurrentHashMap<>();
+		// track RandomAccessFile object of write file descriptors
 		private ConcurrentHashMap<Integer, RandomAccessFile> fdToWrite = new ConcurrentHashMap<>();
-		private ConcurrentHashMap<Integer, File> fdToDir = new ConcurrentHashMap<>();
+		// hashset to help check whether a file desciptor is read-only
 		private HashSet<Integer> readOnlyFds = new HashSet<>();
 
+		/**
+		 * RPC call to read the server copy of a file specified by path. Actual content is only fetched
+		 * when the server copy is newer than the local proxy one.
+		 * @param  path 	file path
+		 * @param  o		open option
+		 * @param  version	version on proxy
+		 * @param  offset	the offset to start reading the server file
+		 * @return a ServerFile object with file content and its metadata
+		 */
 		public synchronized ServerFile readServerFile( String path, OpenOption o, int version, int offset) {
 			ServerFile response = new ServerFile(-1);
 			try {
 				response = stub.readServerFile(path, o, version, offset);
 			} catch (RemoteException e) {
-				System.err.println("Unable to call RPC readServerFile");
 				e.printStackTrace();
-				System.exit(1);
 			}
 			return response;
 		}
 
+		/**
+		 * RPC call to delete the server copy of a file
+		 * @param path 	file path
+		 * @return 0 if the unlink operation is successful, -1 otherwise
+		 */
 		public synchronized int unlinkServerFile( String path ) {
 			int result = -1;
 			try {
 				result = stub.unlinkServerFile(path);
 			} catch (RemoteException e) {
-				System.err.println("Unable to call RPC unlinkServerFile");
 				e.printStackTrace();
-				System.exit(1);
 			}
 			return result;
 		}
 
+		/**
+		 * RPC call to write to the server copy of a file starting at a specified offset
+		 * @param path		relative file path
+		 * @param content   actual content to write
+		 * @param offset	starting offset
+		 * @return a positive number representing the new file version if write the successful, otherwise a negative errno
+		 */
 		public synchronized int writeServerFile( String path, byte[] content, int offset) {
 			int version = -1;
 			try {
 				version = stub.writeServerFile(path, content, offset);
 			} catch (RemoteException e) {
-				System.err.println("Unable to call RPC writeServerFile");
 				e.printStackTrace();
-				System.exit(1);
 			}
 			return version;
 		}
 
+		/**
+		 * Open a file on server specified by the file path and open option. Only fetch from server if the file doesn't exist
+		 * on the proxy or the proxy copy is outdated, otherwise directly read from proxy copy.
+		 * @param path	relative file path
+		 * @param o	    open mode
+		 * @return a positive number for the file descriptor if the operation is successful, otherwise a negative errno
+		 */
 		public synchronized int open( String path, OpenOption o ) {
+			// use intrinsic lock on the cache to avoid concurrent open of the same file
 			synchronized (cache) {
-				System.err.println("Open called on " + path + " with OpenOption = " + o);
 				String normalizedPath = Paths.get(path).normalize().toString();
-				if (normalizedPath.startsWith("..")) return Errors.EPERM;
+				// cannot access file outside of the cache directory
+				if (normalizedPath.startsWith("..")) 
+					return Errors.EPERM;
 				
 				// create subdirectory if needed
 				File cacheFile = new File(normalizedPath);
 				String parentDirName = cacheFile.getParent();
 				if (parentDirName != null) {
 					File parentDir = new File(cacheDir + "/" + parentDirName);
-					if (!parentDir.exists()) {
-						System.err.println("Create parent dir " + parentDirName + " of " + normalizedPath);
+					if (!parentDir.exists())
 						parentDir.mkdirs();
-					}
 				}
 
-				// check if proxy has copy
+				// compare proxy copy and server copy
 				Node node = cache.getReadableNode(normalizedPath);
-				// check file status on server
 				ServerFile response = readServerFile(normalizedPath, o, (node != null) ? node.version : -1, 0);
-				if (!response.valid) return response.errno;
 				long fileSize = response.fileSize;
+				if (!response.valid) 
+					return response.errno; // operation fail
 				
 				RandomAccessFile file;
 				if (o == OpenOption.CREATE_NEW) {
@@ -97,17 +131,16 @@ class Proxy {
 						return Errors.EPERM;
 					}
 					fdToRead.put(nextFd, file);
-					Node newNode = new Node(normalizedPath, newFileName, 1, response.version, 0);
+					// clean-up stale copy and add cache entry
+					Node newNode = new Node(normalizedPath, newFileName, response.version, 0);
 					fdToNode.put(nextFd, newNode);
-					// clean-up stale cache copies
-					cache.removeStaleCopy(normalizedPath);
+					cache.removeStaleCopy(normalizedPath); 
 					if (!cache.addNode(newNode))
-						return Errors.EBUSY;
+						return Errors.EBUSY; // add file fails as it exceeds capacity
 					return nextFd++;
 				} else if (o == OpenOption.CREATE || o == OpenOption.READ || o == OpenOption.WRITE) {
 					if (node != null && response.version == node.version) {
 						// file already cached and version is up-to-date
-						System.err.println("file cached and version up-to-date");
 						try {
 							file = new RandomAccessFile(cacheDir + "/" + node.fileName, "rw");
 						} catch (Exception e) {
@@ -115,30 +148,29 @@ class Proxy {
 						}
 						fdToRead.put(nextFd, file);
 						fdToNode.put(nextFd, node);
+						// update cache entry
 						node.incrRef();
 						cache.moveFront(node);
 					} else {
-						// file not on cache or outdated
+						// file not on cache or outdated: fetch server copy
 						String newFileName =  normalizedPath + "_v" + response.version;
 						try {
 							file = new RandomAccessFile(cacheDir + '/' + newFileName, "rw");
 							file.write(response.content);
 							int offset = response.content.length;
-							// perform chunked write
+							// chunked write
 							while (offset < fileSize) {
 								response = readServerFile(normalizedPath, o, (node != null) ? node.version : -1, offset);
 								file.write(response.content);
 								offset += response.content.length;
 							}
-							// reset file pointer for next read/write
-							file.seek(0);
+							file.seek(0); // reset file pointer for next read/write
 						} catch (Exception e) {
 							return Errors.EPERM;
 						}
 						fdToRead.put(nextFd, file);
-						Node newNode = new Node(normalizedPath, newFileName, 1, response.version, fileSize);
+						Node newNode = new Node(normalizedPath, newFileName, response.version, fileSize);
 						fdToNode.put(nextFd, newNode);
-						// clean-up stale cache copies
 						cache.removeStaleCopy(normalizedPath);
 						if (!cache.addNode(newNode))
 							return Errors.EBUSY;
@@ -152,20 +184,18 @@ class Proxy {
 			}
 		}
 
+		/**
+		 * Close a open file descriptor. If the proxy copy is written to, propagate changes back to server and update the server copy. 
+		 * The proxy copy will also be made visible by all clients. All stale copies of the file will be removed.
+		 * @param fd	 file desciptor
+		 * @return 0 on sucess, a negative number indicating the error occurred otherwise
+		 */
 		public synchronized int close( int fd ) {
-			System.err.println("close called on fd " + fd);
-			// fd is associated with an open directory
-			if (fdToDir.containsKey(fd)) {
-				fdToDir.remove(fd);
-				return 0;
-			}
-
 			if (!fdToNode.containsKey(fd)) 
 				return Errors.EBADF;
 			Node node = fdToNode.get(fd);
 			RandomAccessFile file = fdToRead.containsKey(fd) ? fdToRead.get(fd) : fdToWrite.get(fd);
 			if (fdToWrite.containsKey(fd)) {
-				System.err.println("Propagate changes in " + node.fileName + " back to server!");
 				// propagate changes back to server
 				int version = -1;
 				long fileSize;
@@ -174,9 +204,8 @@ class Proxy {
 					fileSize = file.length();
 					int offset = 0;
 					while (offset < fileSize) {
-						// write at most chunksize
+						// write chunk by chunk
 						byte[] writeBuf = new byte[(int) Math.min(chunkSize, fileSize - offset)];
-						// copy file content
 						file.readFully(writeBuf);
 						version = writeServerFile(node.pathName, writeBuf, offset);
 						offset += writeBuf.length;
@@ -187,12 +216,11 @@ class Proxy {
 				}
 				// update file version		
 				node.updateVersion(version);
-				// rename file and change visibility
+				// rename file to reflect the version and change visibility
 				String newFileName = node.pathName + "_v" + version;
 				File origFile = new File(cacheDir + "/" + node.fileName);
 				File newFile = new File(cacheDir + "/" + newFileName);
 				origFile.renameTo(newFile);
-				System.err.println("Write file renamed from " + node.fileName + " to " + newFileName);
 				node.updateFileName(newFileName);
 				// clean-up stale copy
 				cache.removeStaleCopy(node.pathName);
@@ -216,13 +244,19 @@ class Proxy {
 			return 0;
 		}
 
+		/**
+		 * Write to a file indicated by the file desciptor. A new copy of the file will be created and added to the cache 
+		 * on the first write to the file descriptor, which is only visible to the client that performs the write.
+		 * @param fd   file descriptor
+		 * @param buf  actual contents
+		 * @return the number of bytes written on success, or a negative errno in case of failure
+		 */
 		public synchronized long write( int fd, byte[] buf ) {
-			System.err.println("Write " + buf.length + " bytes to fd " + fd);
 			// fd is invalid or not open for write
 			if (!fdToNode.containsKey(fd) || readOnlyFds.contains(fd)) return Errors.EBADF;
 			long fileSize;
 			RandomAccessFile readFile, writeFile;
-			// create new write file on first write
+			// create a copy to write, if needed
 			if (!fdToWrite.containsKey(fd)) {
 				Node readNode = fdToNode.get(fd);
 				// assign unique file name
@@ -263,7 +297,6 @@ class Proxy {
 				writeFile.write(buf);
 				fileSize = writeFile.length();
 			} catch (IOException e) {
-				// e.g. write to a read-only file
 				return Errors.EBADF;
 			}
 			// update cache size
@@ -272,10 +305,14 @@ class Proxy {
 			return (long) buf.length;
 		}
 
+		/**
+		 * Read from a file on proxy.
+		 * @param fd	file desciptor to read from
+		 * @param buf	byte array to store the contents read
+		 * @return the number of bytes actually read on success, or a negative value indicating the error
+		 */
 		public synchronized long read( int fd, byte[] buf ) {
-			
 			if (!fdToNode.containsKey(fd)) return Errors.EBADF;
-			if (fdToDir.containsKey(fd)) return Errors.EISDIR;
 			long readRes, numBytes;
 			try {
 				readRes = fdToRead.containsKey(fd) ? (long) fdToRead.get(fd).read(buf): (long) fdToWrite.get(fd).read(buf);
@@ -284,20 +321,25 @@ class Proxy {
 			}
 			numBytes = (readRes != -1) ? readRes : 0;
 			cache.moveFront(fdToNode.get(fd));
-			System.err.println("Read " + numBytes + " bytes from fd " + fd);
 			return numBytes;
 		}
 
+		/**
+		 * Reposition read/write file offset
+		 * @param fd	file desciptor 
+		 * @param pos	relative position 
+		 * @param o		lseek option, either from start, from end or from current file pointer
+		 * @return 		the new position on success, or a negative value indicating the error
+		 */
 		public synchronized long lseek( int fd, long pos, LseekOption o ) {
-			System.err.println("Lseek on fd" + fd + " with pos = " + pos + " and LseekOption = " + o);
 			if (!fdToNode.containsKey(fd)) return Errors.EBADF;
-			// calculate seek location
 			Node node = fdToNode.get(fd);
+			// calculate seek location
 			long seekPos;
 			if (o == LseekOption.FROM_START) 
 				seekPos = pos;
 			else if (o == LseekOption.FROM_END)
-				seekPos = node.getFileSize() + pos;
+				seekPos = node.size + pos;
 			else if (o == LseekOption.FROM_CURRENT) {
 				long currPos;
 				try {
@@ -324,6 +366,12 @@ class Proxy {
 			return seekPos;
 		}
 
+		/**
+		 * Delete a file on the server. Only the server copy will be directly deleted, a proxy copy is either being
+		 * used or will be invalided on the next open on the file.
+		 * @param path file path
+		 * @return 0 on success, a negative value indicating the error occured otherwise
+		 */
 		public synchronized int unlink( String path ) {
 			String normalizedPath = Paths.get(path).normalize().toString();
 			if (normalizedPath.startsWith("..")) return Errors.EPERM;
@@ -331,15 +379,17 @@ class Proxy {
 			return unlinkServerFile(normalizedPath);
 		}
 
+		/**
+		 * End session when a client is done. Clean up all states and open files associated with the client.
+		 */
 		public void clientdone(){
 			// close open files
 			for (int fd: fdToNode.keySet())
-				close(fd);
+				this.close(fd);
 			// reset state
 			fdToRead.clear();
 			fdToWrite.clear();
 			fdToNode.clear();
-			fdToDir.clear();
 			readOnlyFds.clear();
 			return;
 		}
@@ -351,24 +401,24 @@ class Proxy {
 		}
 	}
 
+	/**
+	 * Main entry point of the proxy program, which creates an empty cache and establishes a connection to the remote server.
+	 */
 	public static void main(String[] args) throws IOException {
 		serverIP = args[0];
 		serverPort = Integer.valueOf(args[1]);
+		// initialize cache
 		cacheDir = args[2];
 		cache = new Cache(Integer.valueOf(args[3]), cacheDir);
 		nextFd = 0;
-		// look up remote server
+		// connect to remote server
 		try {
 			Registry registry = LocateRegistry.getRegistry(serverIP, serverPort);
 			stub = (RMIInterface) registry.lookup("RMIInterface");
 		} catch (RemoteException e) {
-			System.err.println("Unable to locate registry");
 			e.printStackTrace();
-			System.exit(1);
 		} catch (NotBoundException e) {
-			System.err.println("RMIInterface not found");
 			e.printStackTrace();
-			System.exit(1);
 		}
 		(new RPCreceiver(new FileHandlingFactory())).run();
 	}
