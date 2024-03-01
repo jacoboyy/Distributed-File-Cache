@@ -25,7 +25,7 @@ class Proxy {
 	private static Cache cache;				// proxy cache
 	public static int nextFd;				// a strictly increasing number to supply the unique file descriptor
 	public static RMIInterface stub;		// RMI interface for RPC call to the server
-	public static long chunkSize = 400000;	// maximum size for data transfer in an RPC call
+	public static final long chunkSize = 400000;	// maximum size for data transfer in an RPC call
 
 	/* A nested class to handle each individual client */
 	private static class FileHandler implements FileHandling {

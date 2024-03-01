@@ -16,7 +16,7 @@ public class Server extends UnicastRemoteObject implements RMIInterface {
 
     private String rootdir;                                     // server root directory
     private ConcurrentHashMap<String, Integer> pathToVersion;   // track version of files on server
-    private long chunkSize = 400000;                            // maximum data transfer size in an RPCs
+    private static final long chunkSize = 400000;                            // maximum data transfer size in an RPCs
 
     /**
      * Constructor class for the server object
